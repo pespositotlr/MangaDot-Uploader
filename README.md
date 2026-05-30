@@ -41,14 +41,14 @@ Lets you upload by series name instead of memorizing manga IDs and paths.
 
 ```json
 {
-    "The JOJOLands":      { "manga_id": 23331, "chapter_dir": "C:\\releases\\The JOJOLands" },
-    "3-Gatsu no Lion":    { "manga_id": 581,   "chapter_dir": "C:\\releases\\3-Gatsu no Lion" }
+    "My Favorite Manga":      { "manga_id": 22222, "chapter_dir": "C:\\releases\\My Favorite Manga" },
+    "My Second Favorite Manga":    { "manga_id": 343444,   "chapter_dir": "C:\\releases\\My Second Favorite Manga" }
 }
 ```
 
 Then:
 ```
-python mangadot-upload.py --series "The JOJOLands"
+python mangadot-upload.py --series "My Favorite Manga"
 ```
 
 Series name matching is case-insensitive. You can override either field on the
@@ -88,26 +88,26 @@ nothing is written to disk.
 
 ```
 # Upload everything for a series
-python mangadot-upload.py --series "The JOJOLands"
+python mangadot-upload.py --series "My Favorite Manga"
 
 # Preview what would be uploaded — no upload
-python mangadot-upload.py --series "The JOJOLands" --dry-run
+python mangadot-upload.py --series "My Favorite Manga" --dry-run
 ```
 
 ### Selecting chapters
 
 ```
 # Single chapter
-python mangadot-upload.py --series "The JOJOLands" --chapter 36
+python mangadot-upload.py --series "My Favorite Manga" --chapter 336
 
 # Range
-python mangadot-upload.py --series "The JOJOLands" --start 1 --end 50
+python mangadot-upload.py --series "My Favorite Manga" --start 1 --end 50
 
 # Range with exclusions
-python mangadot-upload.py --series "The JOJOLands" --start 1 --end 50 --exclude 33 34 42.5
+python mangadot-upload.py --series "My Favorite Manga" --start 1 --end 50 --exclude 33 34 42.5
 
 # Everything from chapter 42 onward (useful for resuming after a failure)
-python mangadot-upload.py --series "The JOJOLands" --start 42
+python mangadot-upload.py --series "My Favorite Manga" --start 42
 ```
 
 ### Replacing existing chapters
@@ -117,8 +117,8 @@ that match** (same manga + same chapter number + same language). To delete
 and re-upload them instead:
 
 ```
-python mangadot-upload.py --series "The JOJOLands" --reupload
-python mangadot-upload.py --series "The JOJOLands" --chapter 36 --reupload
+python mangadot-upload.py --series "My Favorite Manga" --reupload
+python mangadot-upload.py --series "My Favorite Manga" --chapter 36 --reupload
 ```
 
 ### Without manga.json
@@ -136,8 +136,8 @@ python mangadot-upload.py --manga 23331 --folder "C:\path\to\chapters"
 If you already have a zip you'd rather upload as-is:
 
 ```
-python mangadot-upload.py --series "The JOJOLands" --zip "C:\ch36.zip" --chapter 36
-python mangadot-upload.py --series "The JOJOLands" --zip "C:\ch36.zip" --chapter 36 --volume 7 --title "Some Title"
+python mangadot-upload.py --series "My Favorite Manga" --zip "C:\ch36.zip" --chapter 36
+python mangadot-upload.py --series "My Favorite Manga" --zip "C:\ch36.zip" --chapter 36 --volume 7 --title "Some Title"
 ```
 
 `--chapter` is required with `--zip`. Volume and title are inferred from the
@@ -255,7 +255,7 @@ silently.
 If you do quit, the script tells you exactly which chapter to resume from:
 
 ```
-python mangadot-upload.py --series "The JOJOLands" --start 42
+python mangadot-upload.py --series "My Favorite Manga" --start 42
 ```
 
 The TUS upload is also resumable mid-chapter — if a chunk fails, the script
