@@ -1114,12 +1114,14 @@ def main():
 
     # Look up the new chapter IDs and emit FINAL_URL lines for orchestrators
     # that parse stdout (matches Mangadex-Scheduled-Uploader's convention).
+    # ?source=user works around a current mangadot.net routing bug where the
+    # bare /chapter/{id} URL doesn't resolve correctly.
     try:
         post_upload = fetch_existing_uploads(session, api_url, manga_id, language)
         for ch in chapters:
             entry = post_upload.get(ch["chapter"])
             if entry and entry.get("id"):
-                print(f"FINAL_URL: {site_url}/chapter/{entry['id']}")
+                print(f"FINAL_URL: {site_url}/chapter/{entry['id']}?source=user")
     except Exception as e:
         print(dim(f"  (could not resolve FINAL_URL: {e})"))
 
