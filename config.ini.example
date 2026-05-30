@@ -1,0 +1,39 @@
+[auth]
+# Your browser's User-Agent — must match the browser you exported cookies from.
+user_agent = Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0
+
+# Choose ONE auth method:
+# Option 1 — email + password
+# email    = your@email.com
+# password = yourpassword
+
+# Option 2 — JSON or Netscape cookies.txt exported from your browser
+# cookies_file = C:\path\to\cookies.txt
+
+# Option 3 — live browser cookie extraction
+browser = firefox
+
+[upload]
+# Fallback manga ID if you don't use --series or --manga
+manga_id = 12345
+
+# Language code
+language = en
+
+# "chapter" or "volume"
+upload_type = chapter
+
+# Your group or scanlator
+group_id = 0000
+# scanlator_name = Your Group Name
+
+[paths]
+# Root folder containing all your series folders.
+# --series will look for subfolders matching manga.json "chapter_dir" values here.
+base_dir = C:\path\to\your\releases
+
+# Fallback if you don't use --series or --folder
+# chapters_dir = C:\path\to\your\releases\Some Series
+
+[site]
+url = https://mangadot.net

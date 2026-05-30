@@ -1,0 +1,2 @@
+httpx>=0.25
+browser-cookie3>=0.20  # only needed if you use browser= in config.ini
