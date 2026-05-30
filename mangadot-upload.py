@@ -9,12 +9,12 @@ Folder naming format: "V01 Ch001 Departure"
   → volume 1, chapter 1, title "Departure"
 
 Usage:
-    python mangadot-upload.py --series "The JOJOLands"
-    python mangadot-upload.py --series "The JOJOLands" --chapter 36
-    python mangadot-upload.py --series "The JOJOLands" --start 1 --end 50 --exclude 33 34
+    python mangadot-upload.py --series "My Favorite Manga"
+    python mangadot-upload.py --series "My Favorite Manga" --chapter 346
+    python mangadot-upload.py --series "My Favorite Manga" --start 1 --end 50 --exclude 333 334
     python mangadot-upload.py --manga 23331 --folder "K:\\path\\to\\chapters"
-    python mangadot-upload.py --series "The JOJOLands" --zip "K:\\path\\to\\ch36.zip" --chapter 36
-    python mangadot-upload.py --dry-run --series "The JOJOLands"
+    python mangadot-upload.py --series "My Favorite Manga" --zip "K:\\path\\to\\ch336.zip" --chapter 336
+    python mangadot-upload.py --dry-run --series "My Favorite Manga"
 """
 
 import argparse
