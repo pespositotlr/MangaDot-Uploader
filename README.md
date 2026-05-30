@@ -1,4 +1,4 @@
-# mangadot-upload
+# MangaDot-Uploader
 
 Folder-based batch uploader for mangadot.net.
 Reads your chapter image folders, zips them in-memory, and uploads them via
