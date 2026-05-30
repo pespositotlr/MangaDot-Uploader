@@ -31,6 +31,7 @@ LOGIN_RESPONSE_TIMEOUT = 15  # seconds after submit before we expect access_toke
 
 
 def load_cache(path: str) -> Optional[dict]:
+    if not os.path.isfile(path):
         return None
     try:
         with open(path, encoding="utf-8") as f:
