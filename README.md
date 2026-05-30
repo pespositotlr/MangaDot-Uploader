@@ -9,9 +9,10 @@ Features:
 - Auto-skips chapters that are already uploaded (or replace them with `--reupload`)
 - Resumable uploads — if a chunk fails, it queries the server's real offset and resumes
 - Retry with backoff on transient network/server errors
-- Auto-refreshes the access token before it expires
-- Interactive re-login flow if Cloudflare blocks the session mid-run
-- Three auth methods: email+password, cookies.txt, or live browser cookie extraction
+- **Schedulable**: an `auto` auth mode that caches cookies and refreshes them by
+  spawning a real Chrome window via `nodriver` when Cloudflare expires them.
+- Four auth methods: `mode=auto` (recommended), email+password (currently blocked
+  by Cloudflare), Netscape/JSON cookies file, or live browser cookie extraction.
 
 ---
 
@@ -153,44 +154,105 @@ zip filename if not given (same parsing rules as folder names).
 
 ## Auth methods (pick one in config.ini)
 
-**Email + password** — simplest:
+### `mode = auto` (recommended)
+
+The only auth method that survives Cloudflare on this site. Reads cached
+cookies from `.auth-cache.json`, verifies them against `/api/auth/me`, and on
+failure spawns a real Chrome window via `nodriver` to log in fresh. The new
+cookies plus Chrome's User-Agent are written back to the cache.
+
+```ini
+[auth]
+mode     = auto
+username = your_mangadot_username
+password = your_password
+# cache_file  = .auth-cache.json   (default)
+# chrome_path = C:\Program Files\Google\Chrome\Application\chrome.exe
+```
+
+Requirements: Chrome installed and `pip install nodriver`. The cache file is
+gitignored. Refresh takes ~10s when triggered; warm-start with valid cache
+takes <1s.
+
+Force a refresh manually with `--refresh-cookies`.
+
+### `email + password` (currently broken)
+
+Was meant to POST `/api/auth/login` directly with httpx. Cloudflare on
+mangadot.net blocks this with the "Just a moment..." JS challenge regardless
+of TLS fingerprint. Left in the code for the day CF on this site is relaxed.
+
 ```ini
 [auth]
 email    = your@email.com
 password = yourpassword
 ```
 
-**Netscape or JSON cookies file** — export from your browser via a cookies extension:
+### `cookies_file`
+
+Netscape or JSON cookies exported from your browser via an extension.
+
 ```ini
 [auth]
 cookies_file = C:\path\to\cookies.txt
 ```
 
-**Live browser cookies** — pulls directly from an installed browser's cookie store:
+### `browser = firefox`
+
+Pulls cookies directly from an installed browser's cookie store (via
+`browser-cookie3`). Requires being logged in to mangadot.net in that browser
+already. Firefox is the only one that reliably works through Cloudflare.
+
 ```ini
 [auth]
 browser = firefox   # brave / chrome / chromium / edge / firefox
 ```
-Requires `browser-cookie3` (already in `requirements.txt`). You must be logged
-in to mangadot.net in that browser. On Windows this may require running as
-Administrator depending on the browser.
-
-**Firefox is recommended.** Chrome and Edge tend to get hit harder by
-Cloudflare and the login can fail outright on those browsers.
 
 ---
 
-## When Cloudflare blocks the session
+## Unattended / programmatic runs
 
-If your `cf_clearance` cookie expires mid-run or the API starts returning
-Cloudflare challenge pages, the script will pause and prompt you:
+`mode = auto` makes the script callable from another tool or scheduler without
+human interaction. When Cloudflare's `cf_clearance` cookie (hours-to-a-day TTL)
+expires, the script auto-opens Chrome, completes the login flow, harvests
+fresh cookies, and continues.
+
+Requirements for the host environment:
+
+1. **`mode = auto`** in `config.ini` with `username` and `password`.
+2. **An interactive desktop session** — Chrome needs a real display to satisfy
+   Cloudflare's anti-bot checks (window size, GPU, screen dimensions). If the
+   caller is a Windows scheduled task, configure it as "Run only when user is
+   logged on". A Session-0 service or remote SSH session will not work.
+3. **Chrome installed** and `pip install nodriver` (in `requirements.txt`).
+
+Cost per invocation:
+
+- **Warm cache** (cf_clearance still valid): <1 s overhead.
+- **Cold cache** (cf_clearance expired): ~10–15 s, during which a Chrome
+  window briefly appears, then closes.
+- **Mid-batch JWT refresh** (~every 15 min during long uploads): triggers
+  another Chrome refresh.
+
+The script exits non-zero on any unrecoverable error. Stdout/stderr include
+ANSI color codes; set `TERM=dumb` or pipe through `strip-ansi` if your caller
+captures logs.
+
+---
+
+## When Cloudflare blocks the session (`browser=`/`cookies_file=` modes)
+
+In the legacy `browser=` and `cookies_file=` modes the script falls back to a
+manual re-login prompt when CF challenges appear:
 
 1. Log out and back in to mangadot.net in Firefox.
 2. Press Enter to retry, or `q` to quit.
 3. Cookies are reloaded and the upload resumes from the same chapter.
 
-If you choose to quit, the script tells you exactly which chapter to resume
-from:
+In `mode = auto` this whole loop is automated — a fresh Chrome refresh runs
+silently.
+
+If you do quit, the script tells you exactly which chapter to resume from:
 
 ```
 python mangadot-upload.py --series "The JOJOLands" --start 42

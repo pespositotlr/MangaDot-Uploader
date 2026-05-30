@@ -1,17 +1,33 @@
 [auth]
-# Your browser's User-Agent — must match the browser you exported cookies from.
+# Your browser's User-Agent. Only consulted for cookies_file / browser modes.
+# For mode=auto, the UA captured by Chrome at refresh time wins.
 user_agent = Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0
 
-# Choose ONE auth method:
-# Option 1 — email + password
+# Pick ONE auth method:
+
+# Option 1 (recommended for unattended / scheduled runs) -- "auto" mode.
+# Reads cached cookies and verifies them; on failure, spawns a real Chrome
+# window via nodriver, navigates to /login, waits for Cloudflare clearance and
+# the invisible Turnstile challenge, then submits username+password to harvest
+# fresh cookies. Cached in .auth-cache.json (gitignored).
+#
+# Requires Chrome installed and `pip install nodriver`.
+mode     = auto
+username = your_mangadot_username
+password = your_password
+# cache_file  = .auth-cache.json
+# chrome_path = C:\Program Files\Google\Chrome\Application\chrome.exe
+
+# Option 2 -- email + password against /api/auth/login (often blocked by
+# Cloudflare; left here for completeness).
 # email    = your@email.com
 # password = yourpassword
 
-# Option 2 — JSON or Netscape cookies.txt exported from your browser
+# Option 3 -- JSON or Netscape cookies.txt exported from your browser.
 # cookies_file = C:\path\to\cookies.txt
 
-# Option 3 — live browser cookie extraction
-browser = firefox
+# Option 4 -- live browser cookie extraction (the original interactive mode).
+# browser = firefox
 
 [upload]
 # Fallback manga ID if you don't use --series or --manga
@@ -28,10 +44,6 @@ group_id = 0000
 # scanlator_name = Your Group Name
 
 [paths]
-# Root folder containing all your series folders.
-# --series will look for subfolders matching manga.json "chapter_dir" values here.
-base_dir = C:\path\to\your\releases
-
 # Fallback if you don't use --series or --folder
 # chapters_dir = C:\path\to\your\releases\Some Series
 

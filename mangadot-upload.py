@@ -610,6 +610,9 @@ def main():
                         help="Skip specific chapters, e.g. --exclude 36 37 42.5")
     parser.add_argument("--reupload", action="store_true",
                         help="Delete and re-upload chapters that already exist")
+    parser.add_argument("--refresh-cookies", action="store_true",
+                        help="Force a fresh nodriver login (auto mode only); "
+                             "ignore cached cookies")
     args = parser.parse_args()
 
     # --chapter doubles as --start/--end when not using --zip
@@ -777,12 +780,62 @@ def main():
     )
     auth = AuthManager(session, site_url, api_url, domain)
 
+    mode         = get("auth", "mode")
     email        = get("auth", "email")
     password     = get("auth", "password")
     cookies_file = get("auth", "cookies_file")
     browser      = get("auth", "browser")
 
-    if email and password:
+    if mode == "auto":
+        username_v = get("auth", "username")
+        password_v = get("auth", "password")
+        if not (username_v and password_v):
+            print(f"  {red('Error:')} mode=auto requires username and password under [auth]")
+            sys.exit(1)
+        cache_file  = get("auth", "cache_file") or os.path.join(SCRIPT_DIR, ".auth-cache.json")
+        chrome_path = get("auth", "chrome_path")
+        try:
+            from auth_strategy import ensure_authenticated
+        except ImportError:
+            print(f"  {red('Error:')} auth_strategy.py not found alongside this script")
+            sys.exit(1)
+
+        print(f"  Authenticating as {bold(username_v)}...", end=" ", flush=True)
+        try:
+            user_info, refresher = ensure_authenticated(
+                session,
+                site_url=site_url,
+                api_url=api_url,
+                domain=domain,
+                cache_path=cache_file,
+                username=username_v,
+                password=password_v,
+                chrome_path=chrome_path,
+                force_refresh=args.refresh_cookies,
+                on_refresh=lambda: print("\n  " + yellow("Cache stale - opening Chrome to refresh cookies...")),
+            )
+        except RuntimeError as e:
+            print(red("FAILED"))
+            print(f"  {e}")
+            sys.exit(1)
+        print(green("OK") + f" - logged in as {bold(user_info.get('username', '?'))}")
+
+        # Sync access_token so AuthManager's JWT-expiry check sees it.
+        auth.access_token = session.cookies.get("access_token")
+
+        # Form-login doesn't issue a refresh_token cookie, so replace the
+        # AuthManager's refresh callback with a full nodriver re-login.
+        def _auto_refresh():
+            print(f"  {dim('[auth] JWT near expiry; refreshing via Chrome...')}")
+            try:
+                refresher()
+                auth.access_token = session.cookies.get("access_token")
+                print(f"  {dim('[auth] refreshed OK')}")
+            except Exception as e:
+                print(f"  {yellow('[auth] refresh failed:')} {e}")
+        auth._refresh = _auto_refresh
+
+    elif email and password:
         print(f"  Logging in as {bold(email)}...", end=" ", flush=True)
         try:
             auth.login(email, password)
@@ -809,7 +862,7 @@ def main():
             sys.exit(1)
     else:
         print(f"  {red('No auth method configured in config.ini.')}")
-        print("  Set email+password, cookies_file, or browser under [auth].")
+        print("  Set mode=auto (+ username/password), email+password, cookies_file, or browser under [auth].")
         sys.exit(1)
 
     # ── Verify auth (with re-login prompt on Cloudflare block) ──
@@ -845,8 +898,12 @@ def main():
                 print(f"  HTTP {resp.status_code}: {resp.text[:500]}")
                 sys.exit(1)
 
-    username = verify_session()
-    print(green("OK") + f" — logged in as {bold(username)}")
+    if mode == "auto":
+        # ensure_authenticated() already verified; reuse the username from there
+        username = user_info.get("username", "unknown")
+    else:
+        username = verify_session()
+        print(green("OK") + f" — logged in as {bold(username)}")
 
     # ── Check for existing uploads ──
     existing_uploads = fetch_existing_uploads(session, api_url, manga_id, language)
@@ -995,20 +1052,32 @@ def main():
                         cf_retry < 2
                     ):
                         print(f"\n  {yellow('Cloudflare block detected mid-upload.')}")
-                        print(f"  {bold('1.')} Log out and back in to mangadot.net in Firefox.")
-                        print(f"  {bold('2.')} Press Enter to retry this chapter, or type \'q\' to quit.")
-                        ch_num = ch["chapter"]
-                        print(f"  (If you quit, resume with: {bold(f'--start {ch_num}')})")
-                        choice = input("  > ").strip().lower()
-                        if choice == "q":
-                            sys.exit(0)
-                        print("  Reloading cookies...", end=" ", flush=True)
-                        session.cookies.clear()
-                        try:
-                            auth.load_from_browser("firefox")
-                            print(green("OK"))
-                        except Exception as reload_err:
-                            print(red(f"FAILED: {reload_err}"))
+                        if mode == "auto":
+                            print(f"  {dim('Refreshing cookies via Chrome (auto mode)...')}")
+                            try:
+                                refresher()
+                                auth.access_token = session.cookies.get("access_token")
+                                print(f"  {dim('Cookies refreshed; retrying.')}")
+                            except Exception as reload_err:
+                                ch_num = ch["chapter"]
+                                print(f"  {red('Auto-refresh failed:')} {reload_err}")
+                                print(f"  Resume with: {bold(f'--start {ch_num}')}")
+                                sys.exit(1)
+                        else:
+                            print(f"  {bold('1.')} Log out and back in to mangadot.net in Firefox.")
+                            print(f"  {bold('2.')} Press Enter to retry this chapter, or type \'q\' to quit.")
+                            ch_num = ch["chapter"]
+                            print(f"  (If you quit, resume with: {bold(f'--start {ch_num}')})")
+                            choice = input("  > ").strip().lower()
+                            if choice == "q":
+                                sys.exit(0)
+                            print("  Reloading cookies...", end=" ", flush=True)
+                            session.cookies.clear()
+                            try:
+                                auth.load_from_browser("firefox")
+                                print(green("OK"))
+                            except Exception as reload_err:
+                                print(red(f"FAILED: {reload_err}"))
                         buf.seek(0)  # reset buffer for retry
                     else:
                         ch_num = ch["chapter"]
@@ -1042,6 +1111,17 @@ def main():
     print(f"  {green('All done!')}  {len(chapters)} chapter{'s' if len(chapters) != 1 else ''} uploaded")
     print(f"  {format_size(uploaded_bytes)} in {format_time(elapsed)}  (avg {format_speed(avg_spd)})")
     print(f"{'=' * 60}\n")
+
+    # Look up the new chapter IDs and emit FINAL_URL lines for orchestrators
+    # that parse stdout (matches Mangadex-Scheduled-Uploader's convention).
+    try:
+        post_upload = fetch_existing_uploads(session, api_url, manga_id, language)
+        for ch in chapters:
+            entry = post_upload.get(ch["chapter"])
+            if entry and entry.get("id"):
+                print(f"FINAL_URL: {site_url}/chapter/{entry['id']}")
+    except Exception as e:
+        print(dim(f"  (could not resolve FINAL_URL: {e})"))
 
 
 if __name__ == "__main__":

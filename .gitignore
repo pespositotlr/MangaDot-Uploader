@@ -3,6 +3,7 @@ cookies.txt
 config.ini
 manga.json
 readme.txt
+.auth-cache.json
 
 # Python
 __pycache__/
