@@ -36,7 +36,7 @@ import httpx
 CHUNK_SIZE           = 5 * 1024 * 1024  # 5 MB
 MAX_BATCH            = 100
 CONCURRENCY_PAUSE    = 0.5
-TOKEN_REFRESH_BUFFER = 120              # seconds before expiry to refresh
+TOKEN_REFRESH_BUFFER = 300              # seconds before expiry to refresh
 IMAGE_EXTS           = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 SCRIPT_DIR           = os.path.dirname(os.path.abspath(__file__))
 MAX_RETRIES          = 3
@@ -1046,6 +1046,19 @@ def main():
                     )
                     break
                 except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401 and mode == "auto":
+                        # JWT expired mid-upload; refresh and retry the chapter.
+                        print(f"\n  {yellow('401 mid-upload; refreshing cookies...')}", flush=True)
+                        try:
+                            refresher()
+                            auth.access_token = session.cookies.get("access_token")
+                            buf.seek(0)
+                            continue
+                        except Exception as refresh_err:
+                            ch_num = ch["chapter"]
+                            print(f"  {red('refresh failed:')} {refresh_err}")
+                            print(f"  Resume with: {bold(f'--start {ch_num}')}")
+                            sys.exit(1)
                     if e.response.status_code == 403 and (
                         "Just a moment" in e.response.text or
                         "challenge-platform" in e.response.text or
@@ -1099,6 +1112,17 @@ def main():
 
         def do_finalize():
             r = session.post(f"{api_url}/uploads/batch/{batch_id}/complete")
+            if r.status_code == 401 and mode == "auto":
+                # JWT expired between the proactive check and the actual call;
+                # force-refresh via Chrome and retry the finalize once.
+                print(f"\n  {yellow('401 on finalize; refreshing cookies and retrying...')}", flush=True)
+                try:
+                    refresher()
+                    auth.access_token = session.cookies.get("access_token")
+                except Exception as refresh_err:
+                    print(f"  {yellow('refresh failed:')} {refresh_err}")
+                else:
+                    r = session.post(f"{api_url}/uploads/batch/{batch_id}/complete")
             r.raise_for_status()
             return r
 
@@ -1116,12 +1140,32 @@ def main():
     # that parse stdout (matches Mangadex-Scheduled-Uploader's convention).
     # ?source=user works around a current mangadot.net routing bug where the
     # bare /chapter/{id} URL doesn't resolve correctly.
+    # /uploads/mine is eventually consistent after batch finalize, so poll.
     try:
-        post_upload = fetch_existing_uploads(session, api_url, manga_id, language)
+        wanted = {float(ch["chapter"]) for ch in chapters}
+        found = {}
+        for attempt in range(10):
+            post_upload = fetch_existing_uploads(session, api_url, manga_id, language)
+            for ch_num in wanted:
+                if ch_num in found:
+                    continue
+                entry = post_upload.get(ch_num)
+                if entry and entry.get("id"):
+                    found[ch_num] = entry["id"]
+            if len(found) == len(wanted):
+                break
+            if attempt < 9:
+                time.sleep(1.5)
         for ch in chapters:
-            entry = post_upload.get(ch["chapter"])
-            if entry and entry.get("id"):
-                print(f"FINAL_URL: {site_url}/chapter/{entry['id']}?source=user")
+            ch_num = float(ch["chapter"])
+            chapter_id = found.get(ch_num)
+            if chapter_id:
+                print(f"FINAL_URL: {site_url}/chapter/{chapter_id}?source=user")
+            else:
+                print(dim(
+                    f"  (FINAL_URL: ch{ch_num:g} not yet visible in /uploads/mine "
+                    f"after 15s; try checking your mangadot.net uploads page)"
+                ))
     except Exception as e:
         print(dim(f"  (could not resolve FINAL_URL: {e})"))
 
