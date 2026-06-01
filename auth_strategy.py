@@ -19,7 +19,13 @@ forced to install it.
 
 import json
 import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
 import time
+import urllib.request
 from typing import Callable, Optional
 
 import httpx
@@ -29,6 +35,86 @@ CF_CLEARANCE_TIMEOUT   = 30  # seconds to wait for the CF interstitial to clear
 TURNSTILE_TIMEOUT      = 30  # seconds for invisible Turnstile to write its token
 LOGIN_RESPONSE_TIMEOUT = 15  # seconds after submit before we expect access_token
 
+
+# ---------------------------------------------------------------------------
+# Process helpers
+# ---------------------------------------------------------------------------
+
+def _kill_proc_tree(proc: Optional[subprocess.Popen]) -> None:
+    """
+    Kill a process and its entire child tree, then wait for it to exit.
+
+    On Windows, plain proc.kill() only signals the root process; Chrome
+    spawns several child processes that keep the CDP port open even after the
+    parent dies.  taskkill /F /T kills the whole job tree atomically.
+
+    On POSIX we kill the process group so forked children are also reaped.
+    """
+    if proc is None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.call(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    # Wait up to 5 s for the OS to reclaim the port before the next attempt.
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _kill_stale_chrome_by_profile_prefix(prefix: str = "mangadot-nodriver") -> None:
+    """
+    On Windows, sweep for any chrome.exe processes whose command line
+    references a temp profile that matches our prefix.  This cleans up
+    leftover processes from previous runs that survived a crash.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        # WMIC is available on all supported Windows versions.
+        result = subprocess.run(
+            [
+                "wmic", "process", "where",
+                f"name='chrome.exe' and commandline like '%{prefix}%'",
+                "get", "processid", "/format:value",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.lower().startswith("processid="):
+                pid_str = line.split("=", 1)[1].strip()
+                if pid_str.isdigit():
+                    subprocess.call(
+                        ["taskkill", "/F", "/T", "/PID", pid_str],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
 
 def load_cache(path: str) -> Optional[dict]:
     if not os.path.isfile(path):
@@ -63,6 +149,10 @@ def apply_cache(session: httpx.Client, cache: dict, domain: str) -> None:
         session.cookies.set(name, value, domain=domain)
 
 
+# ---------------------------------------------------------------------------
+# Session verification
+# ---------------------------------------------------------------------------
+
 def verify_session(session: httpx.Client, api_url: str) -> Optional[dict]:
     """
     Return the user dict on success, None on any failure (no exceptions thrown).
@@ -84,6 +174,10 @@ def verify_session(session: httpx.Client, api_url: str) -> Optional[dict]:
         return None
     return data.get("user") or {"username": "unknown"}
 
+
+# ---------------------------------------------------------------------------
+# nodriver-based cookie refresh
+# ---------------------------------------------------------------------------
 
 def refresh_via_nodriver(
     site_url: str,
@@ -108,14 +202,6 @@ def refresh_via_nodriver(
 
     login_url = site_url.rstrip("/") + "/login"
 
-    import socket
-    import subprocess
-    import sys
-    import tempfile
-    import shutil
-    import urllib.request
-    import time as _time
-
     # Locate Chrome
     resolved_chrome = chrome_path
     if not resolved_chrome:
@@ -127,24 +213,28 @@ def refresh_via_nodriver(
                 "Could not find Chrome. Set [auth] chrome_path in config.ini."
             ) from e
 
-    def _pick_free_port():
+    def _pick_free_port() -> int:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind(("127.0.0.1", 0))
         p = s.getsockname()[1]
         s.close()
         return p
 
-    chrome_proc = None
-    tmp_profile = None
-    free_port   = None
-    stderr_logs = []
+    # Kill any leftover Chrome processes from a previous crashed run before
+    # we start attempting to launch a new one.
+    _kill_stale_chrome_by_profile_prefix("mangadot-nodriver")
 
-    last_error = None
+    chrome_proc: Optional[subprocess.Popen] = None
+    tmp_profile: Optional[str] = None
+    free_port:   Optional[int]  = None
+
+    last_error: Optional[str] = None
+
     for attempt in range(1, 4):
-        port = _pick_free_port()
+        port    = _pick_free_port()
         profile = tempfile.mkdtemp(prefix="mangadot-nodriver-")
-        stderr_log_path = profile + os.sep + "chrome-stderr.log"
-        stderr_logs.append(stderr_log_path)
+        stderr_log_path = os.path.join(profile, "chrome-stderr.log")
+
         chrome_args = [
             resolved_chrome,
             "--remote-allow-origins=*",
@@ -164,82 +254,89 @@ def refresh_via_nodriver(
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1",
         ]
+
         stderr_fh = open(stderr_log_path, "wb")
-        popen_kwargs = {
+        popen_kwargs: dict = {
             "stdin":  subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": stderr_fh,
         }
         if sys.platform == "win32":
+            # CREATE_NEW_PROCESS_GROUP lets taskkill /T walk the full tree.
             popen_kwargs["creationflags"] = (
                 subprocess.DETACHED_PROCESS
                 | subprocess.CREATE_NEW_PROCESS_GROUP
                 | subprocess.CREATE_BREAKAWAY_FROM_JOB
             )
+        else:
+            # On POSIX, start_new_session puts Chrome in its own process group
+            # so os.killpg can reap all children at once.
+            popen_kwargs["start_new_session"] = True
+
         proc = subprocess.Popen(chrome_args, **popen_kwargs)
         try:
             cdp_ready = False
-            for _ in range(90):  # 45s at 0.5s intervals
+            for _ in range(90):  # 45 s at 0.5 s intervals
                 if proc.poll() is not None:
                     break  # Chrome exited early
                 try:
                     with urllib.request.urlopen(
                         f"http://127.0.0.1:{port}/json/version", timeout=2
-                    ) as r:
-                        r.read()
+                    ) as resp:
+                        resp.read()
                         cdp_ready = True
                         break
                 except Exception:
-                    _time.sleep(0.5)
+                    time.sleep(0.5)
+
             if cdp_ready:
                 chrome_proc = proc
-                tmp_profile = profile
-                free_port   = port
+                tmp_profile  = profile
+                free_port    = port
                 stderr_fh.close()
                 break
-            # Did not come up: collect diagnostics
-            try:
-                proc.kill()
-            except Exception:
-                pass
+
+            # CDP did not come up — kill the full tree, collect diagnostics.
             stderr_fh.close()
+            _kill_proc_tree(proc)
             try:
                 with open(stderr_log_path, "rb") as f:
                     tail = f.read()[-800:].decode("utf-8", errors="replace")
             except Exception:
                 tail = "<could not read stderr log>"
-            exit_code = proc.poll()
+            exit_code  = proc.poll()
             last_error = (
                 f"attempt {attempt}/3: Chrome failed to bring up CDP on port "
                 f"{port} within 45s (exit_code={exit_code}). Stderr tail:\n{tail}"
             )
             shutil.rmtree(profile, ignore_errors=True)
             if attempt < 3:
-                _time.sleep(2)  # brief pause before retry
-        except Exception as e:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+                time.sleep(3)  # give the OS time to fully release the port
+
+        except Exception as exc:
             stderr_fh.close()
+            _kill_proc_tree(proc)
             shutil.rmtree(profile, ignore_errors=True)
-            last_error = f"attempt {attempt}/3: {e}"
+            last_error = f"attempt {attempt}/3: {exc}"
             if attempt < 3:
-                _time.sleep(2)
+                time.sleep(3)
 
     if chrome_proc is None:
         raise RuntimeError(
             f"All 3 Chrome launch attempts failed. Last error: {last_error}"
         )
 
-    async def _do():
-        # Connect nodriver to the already-running Chrome via host+port (this
-        # uses nodriver's "connect_existing" path; nodriver does NOT spawn a
-        # new browser process here).
+    # ------------------------------------------------------------------
+    # nodriver async flow
+    # ------------------------------------------------------------------
+    async def _do() -> tuple[dict, str]:
+        # Connect to the already-running Chrome via its CDP port.
+        # nodriver does NOT spawn a new browser process here.
         browser = await uc.start(host="127.0.0.1", port=free_port)
         try:
             page = await browser.get(login_url)
 
+            # Wait for Cloudflare interstitial to clear.
             for _ in range(CF_CLEARANCE_TIMEOUT):
                 await asyncio.sleep(1)
                 try:
@@ -254,6 +351,7 @@ def refresh_via_nodriver(
                     f"{CF_CLEARANCE_TIMEOUT}s"
                 )
 
+            # Wait for invisible Turnstile to populate its hidden input.
             ts_js = (
                 "(() => { const el = document.querySelector("
                 "'input[name=\"cf-turnstile-response\"]'); "
@@ -270,6 +368,7 @@ def refresh_via_nodriver(
                     f"{TURNSTILE_TIMEOUT}s"
                 )
 
+            # Fill and submit the login form.
             user_el = await page.select("#username")
             await user_el.send_keys(username)
             pw_el = await page.select("#password")
@@ -277,6 +376,7 @@ def refresh_via_nodriver(
             btn = await page.select("button[type=submit]")
             await btn.click()
 
+            # Wait for the access_token cookie to appear.
             for _ in range(LOGIN_RESPONSE_TIMEOUT):
                 await asyncio.sleep(1)
                 cookies = await browser.cookies.get_all()
@@ -294,10 +394,11 @@ def refresh_via_nodriver(
                     f"{LOGIN_RESPONSE_TIMEOUT}s. Diagnostic: {me}"
                 )
 
-            cookies = await browser.cookies.get_all()
-            ua = await page.evaluate("navigator.userAgent")
+            cookies   = await browser.cookies.get_all()
+            ua        = await page.evaluate("navigator.userAgent")
             cookie_map = {c.name: c.value for c in cookies}
             return cookie_map, ua
+
         finally:
             try:
                 browser.stop()
@@ -307,13 +408,15 @@ def refresh_via_nodriver(
     try:
         return uc.loop().run_until_complete(_do())
     finally:
-        # Clean up the Chrome process we launched and its temp profile.
-        try:
-            chrome_proc.kill()
-        except Exception:
-            pass
-        shutil.rmtree(tmp_profile, ignore_errors=True)
+        # Kill the full Chrome process tree and remove the temp profile.
+        _kill_proc_tree(chrome_proc)
+        if tmp_profile:
+            shutil.rmtree(tmp_profile, ignore_errors=True)
 
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def ensure_authenticated(
     session: httpx.Client,
@@ -335,7 +438,7 @@ def ensure_authenticated(
     useful when the JWT expires mid-batch and a /auth/refresh isn't available
     (e.g. no refresh_token cookie was issued).
     """
-    def refresher():
+    def refresher() -> None:
         if on_refresh:
             on_refresh()
         cookies, ua = refresh_via_nodriver(site_url, username, password, chrome_path)
