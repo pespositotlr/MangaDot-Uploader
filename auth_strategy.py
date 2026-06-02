@@ -156,23 +156,51 @@ def apply_cache(session: httpx.Client, cache: dict, domain: str) -> None:
 def verify_session(session: httpx.Client, api_url: str) -> Optional[dict]:
     """
     Return the user dict on success, None on any failure (no exceptions thrown).
+
+    Tries the Ory Kratos whoami endpoint first, then falls back to the legacy
+    /auth/me endpoint in case the site adds it back later.
     """
-    try:
-        r = session.get(f"{api_url}/auth/me", timeout=15)
-    except httpx.HTTPError:
-        return None
-    if r.status_code != 200:
-        return None
-    body = r.text
-    if "Just a moment" in body or "challenge-platform" in body:
-        return None
-    try:
-        data = r.json()
-    except Exception:
-        return None
-    if not data.get("authenticated"):
-        return None
-    return data.get("user") or {"username": "unknown"}
+    site_url = api_url.rstrip("/")
+    # Remove trailing /api if present to get the bare site URL
+    if site_url.endswith("/api"):
+        site_url = site_url[:-4]
+
+    candidates = [
+        f"{site_url}/api/.ory/kratos/public/sessions/whoami",
+        f"{site_url}/.ory/kratos/public/sessions/whoami",
+        f"{api_url}/auth/me",
+    ]
+
+    for url in candidates:
+        try:
+            r = session.get(url, timeout=15)
+        except httpx.HTTPError:
+            continue
+        if r.status_code != 200:
+            continue
+        body = r.text
+        if "Just a moment" in body or "challenge-platform" in body:
+            return None
+        try:
+            data = r.json()
+        except Exception:
+            continue
+
+        # Ory Kratos whoami response: {"active": true, "identity": {"traits": {"username": ...}}}
+        if "active" in data:
+            if not data.get("active"):
+                return None
+            traits = data.get("identity", {}).get("traits", {})
+            username = traits.get("username") or traits.get("email") or "unknown"
+            return {"username": username}
+
+        # Legacy /auth/me response: {"authenticated": true, "user": {...}}
+        if "authenticated" in data:
+            if not data.get("authenticated"):
+                return None
+            return data.get("user") or {"username": "unknown"}
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -369,34 +397,71 @@ def refresh_via_nodriver(
                 )
 
             # Fill and submit the login form.
-            user_el = await page.select("#username")
+            # Wait up to 15s for each element to appear rather than selecting once.
+            FORM_TIMEOUT = 15
+
+            async def wait_for_selector(pg, selector, timeout=FORM_TIMEOUT):
+                for _ in range(timeout):
+                    el = await pg.select(selector)
+                    if el is not None:
+                        return el
+                    await asyncio.sleep(1)
+                page_title = await pg.evaluate("document.title")
+                page_url   = await pg.evaluate("window.location.href")
+                raise RuntimeError(
+                    f"Login form element '{selector}' not found after {timeout}s. "
+                    f"Page: {page_title} — {page_url}"
+                )
+
+            async def wait_for_login_button(pg, timeout=FORM_TIMEOUT):
+                for _ in range(timeout):
+                    btns = await pg.select_all("button[type=submit]")
+                    for i, b in enumerate(btns):
+                        txt = await pg.evaluate(
+                            f"document.querySelectorAll('button[type=submit]')[{i}].textContent.trim()"
+                        )
+                        if txt == "Log in":
+                            return b
+                    await asyncio.sleep(1)
+                raise RuntimeError(f"'Log in' button not found after {timeout}s")
+
+            user_el = await wait_for_selector(page, "#identifier")
             await user_el.send_keys(username)
-            pw_el = await page.select("#password")
+            pw_el = await wait_for_selector(page, "#password")
             await pw_el.send_keys(password)
-            btn = await page.select("button[type=submit]")
+            btn = await wait_for_login_button(page)
             await btn.click()
 
-            # Wait for the access_token cookie to appear.
+            # Wait for the ory_kratos_session cookie to appear.
             for _ in range(LOGIN_RESPONSE_TIMEOUT):
                 await asyncio.sleep(1)
                 cookies = await browser.cookies.get_all()
-                if any(c.name == "access_token" for c in cookies):
+                if any(c.name == "ory_kratos_session" for c in cookies):
                     break
             else:
+                debug_url   = await page.evaluate("window.location.href")
+                debug_title = await page.evaluate("document.title")
                 me = await page.evaluate(
-                    "(async () => { const r = await fetch('/api/auth/me', "
+                    "(async () => { const r = await fetch('/api/.ory/kratos/public/sessions/whoami', "
                     "{credentials: 'include'}); return JSON.stringify("
                     "{s: r.status, b: (await r.text()).slice(0, 200)}); })()",
                     await_promise=True,
                 )
                 raise RuntimeError(
-                    f"Login did not produce access_token within "
-                    f"{LOGIN_RESPONSE_TIMEOUT}s. Diagnostic: {me}"
+                    f"Login did not produce ory_kratos_session within "
+                    f"{LOGIN_RESPONSE_TIMEOUT}s. "
+                    f"Page: {debug_title} — {debug_url}. "
+                    f"Diagnostic: {me}"
                 )
 
-            cookies   = await browser.cookies.get_all()
-            ua        = await page.evaluate("navigator.userAgent")
-            cookie_map = {c.name: c.value for c in cookies}
+            cookies    = await browser.cookies.get_all()
+            ua         = await page.evaluate("navigator.userAgent")
+            # Only keep mangadot.net cookies — filter out Bing/MSA/etc cookies
+            # that Chrome picks up from other tabs or redirects.
+            cookie_map = {
+                c.name: c.value for c in cookies
+                if "mangadot" in (c.domain or "")
+            }
             return cookie_map, ua
 
         finally:
