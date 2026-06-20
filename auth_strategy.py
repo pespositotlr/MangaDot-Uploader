@@ -1,115 +1,202 @@
 """
-auth_strategy.py - Resilient auth for mangadot-upload.
+auth_strategy.py - Cookie-based auth for mangadot-upload.
 
 Strategy:
-  1. Load cookies from local cache file.
-  2. Verify with /api/auth/me.
-  3. If verification fails (Cloudflare challenge, expired token, etc.) spawn
-     a real Chrome window via nodriver, navigate to /login, wait for the CF
-     challenge to clear, wait for invisible Turnstile to populate, fill +
-     submit the login form, then harvest the fresh cookies + User-Agent.
+  1. Try cache file first (avoids touching the browser if session still valid).
+  2. Extract cookies directly from your browser using rookiepy (no Chrome
+     automation required — browser can stay open).
+  3. Verify session via a plain requests GET to /api/profile.
 
-The cache lives next to the script as `.auth-cache.json` by default. The
-captured User-Agent is reapplied to the httpx session so cf_clearance stays
-valid (it is fingerprinted against the UA that produced it).
-
-nodriver is imported lazily so users who never need the fallback aren't
-forced to install it.
+Requirements:
+    py -3.13 -m pip install rookiepy requests
 """
 
 import json
 import os
-import shutil
-import socket
-import subprocess
-import sys
-import tempfile
 import time
-import urllib.request
 from typing import Callable, Optional
 
-import httpx
+import requests
 
 
-CF_CLEARANCE_TIMEOUT   = 30  # seconds to wait for the CF interstitial to clear
-TURNSTILE_TIMEOUT      = 30  # seconds for invisible Turnstile to write its token
-LOGIN_RESPONSE_TIMEOUT = 15  # seconds after submit before we expect access_token
+CACHE_MAX_AGE = 30 * 24 * 3600  # 30 days
+# Match the UA to whichever browser's cf_clearance we're using.
+# Cloudflare validates cf_clearance against both TLS fingerprint AND User-Agent.
+BROWSER_UA = {
+    "chrome":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
+    "brave":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "edge":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0",
+    "opera":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 OPR/122.0.0.0",
+    "vivaldi": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Vivaldi/7.4.3684.38",
+}
+DEFAULT_UA = BROWSER_UA["chrome"]  # fallback
+
+# Supported rookiepy extractors: (display_name, rookiepy_function_name)
+SUPPORTED_BROWSERS = [
+    ("Chrome",  "chrome"),
+    ("Firefox", "firefox"),
+    ("Brave",   "brave"),
+    ("Edge",    "edge"),
+    ("Opera",   "opera"),
+    ("Vivaldi", "vivaldi"),
+]
 
 
 # ---------------------------------------------------------------------------
-# Process helpers
+# rookiepy extraction
 # ---------------------------------------------------------------------------
 
-def _kill_proc_tree(proc: Optional[subprocess.Popen]) -> None:
+def _find_firefox_profile() -> Optional[str]:
     """
-    Kill a process and its entire child tree, then wait for it to exit.
-
-    On Windows, plain proc.kill() only signals the root process; Chrome
-    spawns several child processes that keep the CDP port open even after the
-    parent dies.  taskkill /F /T kills the whole job tree atomically.
-
-    On POSIX we kill the process group so forked children are also reaped.
+    Return the path to the Firefox profile that actually contains a
+    cookies.sqlite, preferring 'default-release' over the bare 'default'
+    stub Firefox creates as a migration placeholder.
     """
-    if proc is None:
-        return
-    if sys.platform == "win32":
-        try:
-            subprocess.call(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-    else:
-        try:
-            import signal
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    # Wait up to 5 s for the OS to reclaim the port before the next attempt.
-    try:
-        proc.wait(timeout=5)
-    except Exception:
-        pass
+    import configparser
+    firefox_dir = os.path.expandvars(r"%APPDATA%\Mozilla\Firefox")
+    profiles_ini = os.path.join(firefox_dir, "profiles.ini")
+    if not os.path.isfile(profiles_ini):
+        return None
+
+    cfg = configparser.ConfigParser()
+    cfg.read(profiles_ini, encoding="utf-8")
+
+    candidates = []
+    for section in cfg.sections():
+        if not section.startswith("Profile"):
+            continue
+        path   = cfg.get(section, "Path", fallback="")
+        is_rel = cfg.getint(section, "IsRelative", fallback=1)
+        if is_rel:
+            if not path.startswith("Profiles"):
+                full = os.path.join(firefox_dir, "Profiles", path)
+            else:
+                full = os.path.join(firefox_dir, path)
+        else:
+            full = path
+        if os.path.isfile(os.path.join(full, "cookies.sqlite")):
+            candidates.append(full)
+
+    if not candidates:
+        return None
+    for c in candidates:
+        if "default-release" in c:
+            return c
+    return candidates[0]
 
 
-def _kill_stale_chrome_by_profile_prefix(prefix: str = "mangadot-nodriver") -> None:
+def _read_firefox_cookies_direct(domain: str) -> tuple:
     """
-    On Windows, sweep for any chrome.exe processes whose command line
-    references a temp profile that matches our prefix.  This cleans up
-    leftover processes from previous runs that survived a crash.
+    Read Firefox cookies for *domain* directly from the correct profile's
+    cookies.sqlite — bypassing rookiepy's broken profile auto-detection.
+    Works with Firefox open (copies the db to a temp file first).
+
+    Returns (cookies_dict, cf_clearance_expiry_epoch_or_None).
     """
-    if sys.platform != "win32":
-        return
-    try:
-        # WMIC is available on all supported Windows versions.
-        result = subprocess.run(
-            [
-                "wmic", "process", "where",
-                f"name='chrome.exe' and commandline like '%{prefix}%'",
-                "get", "processid", "/format:value",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
+    import sqlite3, shutil, tempfile
+    profile = _find_firefox_profile()
+    if not profile:
+        raise RuntimeError(
+            "Could not locate a Firefox profile with cookies.sqlite. "
+            "Make sure Firefox is installed and you have logged in at least once."
         )
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.lower().startswith("processid="):
-                pid_str = line.split("=", 1)[1].strip()
-                if pid_str.isdigit():
-                    subprocess.call(
-                        ["taskkill", "/F", "/T", "/PID", pid_str],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-    except Exception:
-        pass
+    db_path = os.path.join(profile, "cookies.sqlite")
+    # Copy to temp file so we can read it while Firefox is open
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        shutil.copy2(db_path, tmp_path)
+        conn = sqlite3.connect(tmp_path)
+        rows = conn.execute(
+            "SELECT name, value, expiry FROM moz_cookies WHERE host LIKE ?",
+            (f"%{domain}%",)
+        ).fetchall()
+        conn.close()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    if not rows:
+        raise RuntimeError(
+            f"No cookies found for {domain!r} in Firefox profile at: {profile}. "
+            f"Make sure you are logged in to {domain} in Firefox."
+        )
+    cookies = {name: value for name, value, _ in rows}
+    cf_expiry = None
+    for name, _, expiry in rows:
+        if name == "cf_clearance":
+            cf_expiry = expiry  # Firefox stores this as a Unix epoch (seconds)
+            break
+    return cookies, cf_expiry
+
+
+def _browser_ua(browser: str) -> str:
+    """Return the correct User-Agent string for the given browser."""
+    return BROWSER_UA.get(browser.lower(), DEFAULT_UA)
+
+
+def _extract_cookies_rookiepy(browser: str, domain: str) -> dict:
+    """
+    Use rookiepy to pull cookies for *domain* from the given browser.
+    Browser can be open — rookiepy reads the profile directly without
+    needing an exclusive lock.
+
+    Returns a plain dict {name: value}.
+    Raises RuntimeError on failure.
+    """
+    try:
+        import rookiepy
+    except ImportError:
+        raise RuntimeError(
+            "rookiepy is not installed.\n"
+            "Run:  py -3.13 -m pip install rookiepy"
+        )
+
+    fn = getattr(rookiepy, browser.lower(), None)
+    if fn is None:
+        supported = ", ".join(name for _, name in SUPPORTED_BROWSERS)
+        raise ValueError(
+            f"Unsupported browser: {browser!r}. "
+            f"Supported: {supported}"
+        )
+
+    # For Firefox, bypass rookiepy entirely and read the correct profile's
+    # cookies.sqlite directly — rookiepy's auto-detection picks the wrong
+    # profile when multiple profiles exist (e.g. default vs default-release).
+    if browser.lower() == "firefox":
+        cookies, _cf_expiry = _read_firefox_cookies_direct(domain)
+        if not cookies:
+            raise RuntimeError(
+                f"No cookies found for {domain!r} in Firefox. "
+                f"Make sure you are logged in to {domain} in Firefox."
+            )
+        return cookies
+
+    try:
+        raw = fn(domains=[domain, f".{domain}"])
+    except Exception as e:
+        raise RuntimeError(
+            f"rookiepy could not read cookies from {browser}: {e}\n"
+            f"Make sure you are logged in to {domain} in {browser} "
+            f"and the browser profile is accessible."
+        ) from e
+
+    if not raw:
+        raise RuntimeError(
+            f"No cookies found for {domain!r} in {browser}. "
+            f"Make sure you are logged in to {domain} in {browser}."
+        )
+
+    cookies = {c["name"]: c["value"] for c in raw if c.get("name")}
+    print(f"  [debug-raw] rookiepy found {len(raw)} cookies for {domain}:")
+    for c in raw:
+        name = c.get("name", "?")
+        val  = c.get("value", "")
+        display = val if len(val) <= 40 else val[:40] + "..."
+        print(f"  [debug-raw]   {name} = {display!r}")
+    return cookies
 
 
 # ---------------------------------------------------------------------------
@@ -117,412 +204,199 @@ def _kill_stale_chrome_by_profile_prefix(prefix: str = "mangadot-nodriver") -> N
 # ---------------------------------------------------------------------------
 
 def load_cache(path: str) -> Optional[dict]:
-    if not os.path.isfile(path):
-        return None
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        if time.time() - data.get("saved_at", 0) > CACHE_MAX_AGE:
+            return None
+        if not data.get("cookies"):
+            return None
+        return data
+    except Exception:
         return None
-    if not isinstance(data, dict) or "cookies" not in data:
-        return None
-    return data
 
 
 def save_cache(path: str, cookies: dict, user_agent: str) -> None:
-    payload = {
-        "saved_at":   int(time.time()),
+    data = {
+        "saved_at":   time.time(),
         "user_agent": user_agent,
         "cookies":    cookies,
     }
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
-def apply_cache(session: httpx.Client, cache: dict, domain: str) -> None:
-    ua = cache.get("user_agent")
-    if ua:
-        session.headers["User-Agent"] = ua
-    for name, value in cache.get("cookies", {}).items():
-        session.cookies.set(name, value, domain=domain)
+def _apply_cookies(session: requests.Session, cookies: dict,
+                   ua: str, domain: str) -> None:
+    session.cookies.clear()
+    session.headers["User-Agent"] = ua
+    for name, value in cookies.items():
+        session.cookies.set(name, value, domain=f".{domain.lstrip('.')}")
 
 
 # ---------------------------------------------------------------------------
 # Session verification
 # ---------------------------------------------------------------------------
 
-def verify_session(session: httpx.Client, api_url: str) -> Optional[dict]:
+def verify_session(session: requests.Session, site_url: str,
+                   debug: bool = False) -> Optional[dict]:
     """
-    Return the user dict on success, None on any failure (no exceptions thrown).
-
-    Tries the Ory Kratos whoami endpoint first, then falls back to the legacy
-    /auth/me endpoint in case the site adds it back later.
+    Hit /api/profile with plain requests.
+    The session must already have the correct User-Agent set to match the
+    browser the cf_clearance cookie came from — Cloudflare validates both.
+    Returns {"username": "..."} on success, None on failure.
     """
-    site_url = api_url.rstrip("/")
-    # Remove trailing /api if present to get the bare site URL
-    if site_url.endswith("/api"):
-        site_url = site_url[:-4]
-
-    candidates = [
-        f"{site_url}/api/.ory/kratos/public/sessions/whoami",
-        f"{site_url}/.ory/kratos/public/sessions/whoami",
-        f"{api_url}/auth/me",
-    ]
-
-    for url in candidates:
-        try:
-            r = session.get(url, timeout=15)
-        except httpx.HTTPError:
-            continue
-        if r.status_code != 200:
-            continue
-        body = r.text
-        if "Just a moment" in body or "challenge-platform" in body:
-            return None
-        try:
-            data = r.json()
-        except Exception:
-            continue
-
-        # Ory Kratos whoami response: {"active": true, "identity": {"traits": {"username": ...}}}
-        if "active" in data:
-            if not data.get("active"):
-                return None
-            traits = data.get("identity", {}).get("traits", {})
-            username = traits.get("username") or traits.get("email") or "unknown"
-            return {"username": username}
-
-        # Legacy /auth/me response: {"authenticated": true, "user": {...}}
-        if "authenticated" in data:
-            if not data.get("authenticated"):
-                return None
-            return data.get("user") or {"username": "unknown"}
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# nodriver-based cookie refresh
-# ---------------------------------------------------------------------------
-
-def refresh_via_nodriver(
-    site_url: str,
-    username: str,
-    password: str,
-    chrome_path: Optional[str] = None,
-) -> tuple[dict, str]:
-    """
-    Open a real Chrome window, complete the CF + Turnstile + login flow, and
-    return (cookies_dict, user_agent).
-
-    Raises RuntimeError with a descriptive message on any failure.
-    """
+    url = f"{site_url.rstrip('/')}/api/profile"
     try:
-        import asyncio
-        import nodriver as uc
-    except ImportError as e:
-        raise RuntimeError(
-            "nodriver is required for the 'auto' auth mode. "
-            "Install with: pip install nodriver"
-        ) from e
+        r = session.get(url, timeout=15)
+    except Exception as e:
+        if debug:
+            print(f"  [debug] verify_session request failed: {e}")
+        return None
 
-    login_url = site_url.rstrip("/") + "/login"
+    if debug:
+        print(f"  [debug] GET {url} -> HTTP {r.status_code}")
+        print(f"  [debug] Response body (first 500 chars):")
+        print(f"  [debug]   {r.text[:500]!r}")
 
-    # Locate Chrome
-    resolved_chrome = chrome_path
-    if not resolved_chrome:
-        try:
-            from nodriver.core.config import find_chrome_executable
-            resolved_chrome = find_chrome_executable()
-        except Exception as e:
-            raise RuntimeError(
-                "Could not find Chrome. Set [auth] chrome_path in config.ini."
-            ) from e
-
-    def _pick_free_port() -> int:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))
-        p = s.getsockname()[1]
-        s.close()
-        return p
-
-    # Kill any leftover Chrome processes from a previous crashed run before
-    # we start attempting to launch a new one.
-    _kill_stale_chrome_by_profile_prefix("mangadot-nodriver")
-
-    chrome_proc: Optional[subprocess.Popen] = None
-    tmp_profile: Optional[str] = None
-    free_port:   Optional[int]  = None
-
-    last_error: Optional[str] = None
-
-    for attempt in range(1, 4):
-        port    = _pick_free_port()
-        profile = tempfile.mkdtemp(prefix="mangadot-nodriver-")
-        stderr_log_path = os.path.join(profile, "chrome-stderr.log")
-
-        chrome_args = [
-            resolved_chrome,
-            "--remote-allow-origins=*",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-default-apps",
-            "--no-service-autorun",
-            "--homepage=about:blank",
-            "--no-pings",
-            "--password-store=basic",
-            "--disable-infobars",
-            "--disable-breakpad",
-            "--disable-session-crashed-bubble",
-            "--disable-search-engine-choice-screen",
-            "--disable-features=IsolateOrigins,site-per-process",
-            f"--user-data-dir={profile}",
-            f"--remote-debugging-port={port}",
-            "--remote-debugging-address=127.0.0.1",
-        ]
-
-        stderr_fh = open(stderr_log_path, "wb")
-        popen_kwargs: dict = {
-            "stdin":  subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": stderr_fh,
-        }
-        if sys.platform == "win32":
-            # CREATE_NEW_PROCESS_GROUP lets taskkill /T walk the full tree.
-            popen_kwargs["creationflags"] = (
-                subprocess.DETACHED_PROCESS
-                | subprocess.CREATE_NEW_PROCESS_GROUP
-                | subprocess.CREATE_BREAKAWAY_FROM_JOB
-            )
-        else:
-            # On POSIX, start_new_session puts Chrome in its own process group
-            # so os.killpg can reap all children at once.
-            popen_kwargs["start_new_session"] = True
-
-        proc = subprocess.Popen(chrome_args, **popen_kwargs)
-        try:
-            cdp_ready = False
-            for _ in range(90):  # 45 s at 0.5 s intervals
-                if proc.poll() is not None:
-                    break  # Chrome exited early
-                try:
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/json/version", timeout=2
-                    ) as resp:
-                        resp.read()
-                        cdp_ready = True
-                        break
-                except Exception:
-                    time.sleep(0.5)
-
-            if cdp_ready:
-                chrome_proc = proc
-                tmp_profile  = profile
-                free_port    = port
-                stderr_fh.close()
-                break
-
-            # CDP did not come up — kill the full tree, collect diagnostics.
-            stderr_fh.close()
-            _kill_proc_tree(proc)
-            try:
-                with open(stderr_log_path, "rb") as f:
-                    tail = f.read()[-800:].decode("utf-8", errors="replace")
-            except Exception:
-                tail = "<could not read stderr log>"
-            exit_code  = proc.poll()
-            last_error = (
-                f"attempt {attempt}/3: Chrome failed to bring up CDP on port "
-                f"{port} within 45s (exit_code={exit_code}). Stderr tail:\n{tail}"
-            )
-            shutil.rmtree(profile, ignore_errors=True)
-            if attempt < 3:
-                time.sleep(3)  # give the OS time to fully release the port
-
-        except Exception as exc:
-            stderr_fh.close()
-            _kill_proc_tree(proc)
-            shutil.rmtree(profile, ignore_errors=True)
-            last_error = f"attempt {attempt}/3: {exc}"
-            if attempt < 3:
-                time.sleep(3)
-
-    if chrome_proc is None:
-        raise RuntimeError(
-            f"All 3 Chrome launch attempts failed. Last error: {last_error}"
-        )
-
-    # ------------------------------------------------------------------
-    # nodriver async flow
-    # ------------------------------------------------------------------
-    async def _do() -> tuple[dict, str]:
-        # Connect to the already-running Chrome via its CDP port.
-        # nodriver does NOT spawn a new browser process here.
-        browser = await uc.start(host="127.0.0.1", port=free_port)
-        try:
-            page = await browser.get(login_url)
-
-            # Wait for Cloudflare interstitial to clear.
-            for _ in range(CF_CLEARANCE_TIMEOUT):
-                await asyncio.sleep(1)
-                try:
-                    title = await page.evaluate("document.title")
-                except Exception:
-                    title = None
-                if title and "Just a moment" not in title:
-                    break
-            else:
-                raise RuntimeError(
-                    f"Cloudflare challenge did not clear after "
-                    f"{CF_CLEARANCE_TIMEOUT}s"
-                )
-
-            # Wait for invisible Turnstile to populate its hidden input.
-            ts_js = (
-                "(() => { const el = document.querySelector("
-                "'input[name=\"cf-turnstile-response\"]'); "
-                "return el ? (el.value || '') : ''; })()"
-            )
-            for _ in range(TURNSTILE_TIMEOUT):
-                await asyncio.sleep(1)
-                ts = await page.evaluate(ts_js)
-                if ts and len(ts) > 10:
-                    break
-            else:
-                raise RuntimeError(
-                    f"Turnstile token did not populate after "
-                    f"{TURNSTILE_TIMEOUT}s"
-                )
-
-            # Fill and submit the login form.
-            # Wait up to 15s for each element to appear rather than selecting once.
-            FORM_TIMEOUT = 15
-
-            async def wait_for_selector(pg, selector, timeout=FORM_TIMEOUT):
-                for _ in range(timeout):
-                    el = await pg.select(selector)
-                    if el is not None:
-                        return el
-                    await asyncio.sleep(1)
-                page_title = await pg.evaluate("document.title")
-                page_url   = await pg.evaluate("window.location.href")
-                raise RuntimeError(
-                    f"Login form element '{selector}' not found after {timeout}s. "
-                    f"Page: {page_title} — {page_url}"
-                )
-
-            async def wait_for_login_button(pg, timeout=FORM_TIMEOUT):
-                for _ in range(timeout):
-                    btns = await pg.select_all("button[type=submit]")
-                    for i, b in enumerate(btns):
-                        txt = await pg.evaluate(
-                            f"document.querySelectorAll('button[type=submit]')[{i}].textContent.trim()"
-                        )
-                        if txt == "Log in":
-                            return b
-                    await asyncio.sleep(1)
-                raise RuntimeError(f"'Log in' button not found after {timeout}s")
-
-            user_el = await wait_for_selector(page, "#identifier")
-            await user_el.send_keys(username)
-            pw_el = await wait_for_selector(page, "#password")
-            await pw_el.send_keys(password)
-            btn = await wait_for_login_button(page)
-            await btn.click()
-
-            # Wait for the ory_kratos_session cookie to appear.
-            for _ in range(LOGIN_RESPONSE_TIMEOUT):
-                await asyncio.sleep(1)
-                cookies = await browser.cookies.get_all()
-                if any(c.name == "ory_kratos_session" for c in cookies):
-                    break
-            else:
-                debug_url   = await page.evaluate("window.location.href")
-                debug_title = await page.evaluate("document.title")
-                me = await page.evaluate(
-                    "(async () => { const r = await fetch('/api/.ory/kratos/public/sessions/whoami', "
-                    "{credentials: 'include'}); return JSON.stringify("
-                    "{s: r.status, b: (await r.text()).slice(0, 200)}); })()",
-                    await_promise=True,
-                )
-                raise RuntimeError(
-                    f"Login did not produce ory_kratos_session within "
-                    f"{LOGIN_RESPONSE_TIMEOUT}s. "
-                    f"Page: {debug_title} — {debug_url}. "
-                    f"Diagnostic: {me}"
-                )
-
-            cookies    = await browser.cookies.get_all()
-            ua         = await page.evaluate("navigator.userAgent")
-            # Only keep mangadot.net cookies — filter out Bing/MSA/etc cookies
-            # that Chrome picks up from other tabs or redirects.
-            cookie_map = {
-                c.name: c.value for c in cookies
-                if "mangadot" in (c.domain or "")
-            }
-            return cookie_map, ua
-
-        finally:
-            try:
-                browser.stop()
-            except Exception:
-                pass
+    if r.status_code != 200:
+        if debug:
+            print(f"  [debug] Non-200 status; verification failed")
+        return None
+    if "Just a moment" in r.text or "challenge-platform" in r.text:
+        if debug:
+            print(f"  [debug] Cloudflare challenge page detected")
+        return None
 
     try:
-        return uc.loop().run_until_complete(_do())
-    finally:
-        # Kill the full Chrome process tree and remove the temp profile.
-        _kill_proc_tree(chrome_proc)
-        if tmp_profile:
-            shutil.rmtree(tmp_profile, ignore_errors=True)
+        data = r.json()
+    except Exception as e:
+        if debug:
+            print(f"  [debug] JSON parse failed: {e}")
+        return None
+
+    # /api/profile returns {"profile": {"email": "...", ...}}
+    profile = data.get("profile", {})
+    username = (
+        profile.get("username")
+        or profile.get("email")
+        or data.get("username")
+        or data.get("email")
+        or "unknown"
+    )
+    return {"username": username}
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public API
 # ---------------------------------------------------------------------------
+
+def _cf_clearance_is_fresh(domain: str, browser: str, debug: bool = False) -> bool:
+    """
+    Check whether the browser's current cf_clearance cookie is still within
+    its expiry window. Only implemented for Firefox (direct SQLite read);
+    for other browsers we can't cheaply check expiry without rookiepy
+    support, so we conservatively return True and let verify_session()
+    be the source of truth.
+    """
+    if browser.lower() != "firefox":
+        return True
+    try:
+        _, cf_expiry = _read_firefox_cookies_direct(domain)
+    except Exception:
+        return False
+    if not cf_expiry:
+        return False
+    fresh = cf_expiry > time.time() + 60  # 60s safety margin
+    if debug:
+        remaining = cf_expiry - time.time()
+        print(f"  [debug] cf_clearance expiry: {cf_expiry} "
+              f"({'fresh, ' + str(int(remaining)) + 's left' if fresh else 'STALE'})")
+    return fresh
+
 
 def ensure_authenticated(
-    session: httpx.Client,
+    session: requests.Session,
     *,
     site_url: str,
-    api_url: str,
+    api_url: str,            # kept for interface compatibility; not used
     domain: str,
     cache_path: str,
-    username: str,
-    password: str,
-    chrome_path: Optional[str] = None,
+    username: str,           # kept for interface compatibility; not used
+    password: str,           # kept for interface compatibility; not used
+    browser: str = "chrome",
     force_refresh: bool = False,
     on_refresh: Optional[Callable[[], None]] = None,
-) -> tuple[dict, Callable[[], None]]:
+    debug: bool = False,
+) -> tuple:
     """
-    Returns (user_dict, refresher).
+    Returns (user_dict, refresher_callable).
 
-    refresher() can be called later to force a fresh nodriver-based login —
-    useful when the JWT expires mid-batch and a /auth/refresh isn't available
-    (e.g. no refresh_token cookie was issued).
+    Auth priority:
+      1. Cache file — but ONLY if the browser's cf_clearance is still fresh
+         (checked via its real expiry timestamp in cookies.sqlite for
+         Firefox). A dated cache with an expired cf_clearance is skipped
+         automatically rather than being tried and failing.
+      2. rookiepy / direct SQLite read — pulls fresh cookies from the
+         browser profile (browser can stay open; no automation needed).
+
+    The refresher re-reads from the browser and updates the session + cache.
+    Pass debug=True to print cookies found, expiry checks, and HTTP details.
     """
+
+    ua = _browser_ua(browser)
+
+    def _apply_and_verify(cookies: dict, ua: str) -> Optional[dict]:
+        _apply_cookies(session, cookies, ua, domain)
+        if debug:
+            print(f"  [debug] User-Agent being used: {ua!r}")
+            print(f"  [debug] Cookies being sent to {domain}:")
+            for k, v in cookies.items():
+                display = v if len(v) <= 40 else v[:40] + "..."
+                print(f"  [debug]   {k} = {display!r}")
+        return verify_session(session, site_url, debug=debug)
+
     def refresher() -> None:
         if on_refresh:
             on_refresh()
-        cookies, ua = refresh_via_nodriver(site_url, username, password, chrome_path)
+        cookies = _extract_cookies_rookiepy(browser, domain)
         save_cache(cache_path, cookies, ua)
-        session.cookies.clear()
-        apply_cache(session, {"cookies": cookies, "user_agent": ua}, domain)
+        _apply_and_verify(cookies, ua)
 
-    cache = None if force_refresh else load_cache(cache_path)
-    if cache:
-        apply_cache(session, cache, domain)
-        user = verify_session(session, api_url)
-        if user:
-            return user, refresher
+    # 1. Try cache first, but only if cf_clearance is still fresh in the
+    #    browser right now. A 30-day-old cache with a long-expired
+    #    cf_clearance will always 403, so skip straight to a fresh read
+    #    instead of wasting a round trip on a doomed verify call.
+    if not force_refresh:
+        cache = load_cache(cache_path)
+        if cache:
+            if _cf_clearance_is_fresh(domain, browser, debug=debug):
+                user = _apply_and_verify(
+                    cache["cookies"], cache.get("user_agent", ua)
+                )
+                if user:
+                    return user, refresher
+            elif debug:
+                print("  [debug] Skipping cache — cf_clearance is stale; "
+                      "re-reading from browser instead.")
 
-    refresher()
-    user = verify_session(session, api_url)
-    if not user:
-        raise RuntimeError(
-            "Refreshed cookies still failed verification - the site's login "
-            "flow may have changed (form selectors, payload schema, etc.)."
-        )
-    return user, refresher
+    # 2. Extract fresh cookies via rookiepy / direct SQLite read
+    if on_refresh:
+        on_refresh()
+
+    try:
+        cookies = _extract_cookies_rookiepy(browser, domain)
+    except Exception as e:
+        raise RuntimeError(f"Authentication failed: {e}") from e
+
+    save_cache(cache_path, cookies, ua)
+    user = _apply_and_verify(cookies, ua)
+    if user:
+        return user, refresher
+
+    raise RuntimeError(
+        "Authentication failed: cookies were read from the browser but "
+        "session verification failed.\n"
+        f"Make sure you are logged in to {domain} in your browser and have "
+        "passed any Cloudflare challenge (visit the site once manually if needed)."
+    )

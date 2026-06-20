@@ -28,7 +28,9 @@ import sys
 import time
 import zipfile
 
-import httpx
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -83,15 +85,17 @@ class _TusConflict(Exception):
 
 def is_retryable(exc):
     """Return True for transient network/server errors worth retrying."""
-    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+    if isinstance(exc, (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError)):
         return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (502, 503, 504, 520, 521, 522, 524)
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return exc.response is not None and exc.response.status_code in (
+            502, 503, 504, 520, 521, 522, 524)
     return False
 
 def get_tus_offset(session, upload_url):
     """Ask the TUS server how many bytes it has received so far."""
-    resp = session.head(upload_url, headers={"Tus-Resumable": "1.0.0"})
+    resp = session.head(upload_url, headers={"Tus-Resumable": "1.0.0"}, timeout=30)
     resp.raise_for_status()
     return int(resp.headers.get("Upload-Offset", 0))
 
@@ -274,6 +278,7 @@ class AuthManager:
         resp = self.session.post(
             f"{self.api_url}/auth/login",
             json={"email": email, "password": password},
+            timeout=30,
         )
         if resp.status_code != 200:
             raise RuntimeError(
@@ -335,34 +340,33 @@ class AuthManager:
 
     def load_from_browser(self, browser):
         try:
-            import browser_cookie3
+            import rookiepy
         except ImportError:
             raise RuntimeError(
-                "browser-cookie3 is not installed. Run: pip install browser-cookie3"
+                "rookiepy is not installed.\n"
+                "Run: py -3.13 -m pip install rookiepy"
             )
-        fn = getattr(browser_cookie3, browser.lower(), None)
+        fn = getattr(rookiepy, browser.lower(), None)
         if fn is None:
             raise ValueError(
-                f"Unsupported browser: {browser}. "
-                "Supported: brave, chrome, chromium, edge, firefox"
+                f"Unsupported browser: {browser!r}. "
+                "Supported: chrome, firefox, brave, edge, opera, vivaldi"
             )
         try:
-            cj = fn(domain_name=self.domain)
+            raw = fn(domains=[self.domain, f".{self.domain}"])
         except Exception as e:
             raise RuntimeError(
                 f"Could not read cookies from {browser}: {e}\n"
                 f"Make sure you are logged in to {self.domain} in {browser}."
             ) from e
-        for c in cj:
-            # Strip leading dot that browser-cookie3 often includes
-            cookie_domain = (c.domain or self.domain).lstrip(".")
-            self.session.cookies.set(
-                c.name, c.value,
-                domain=cookie_domain,
-                path=c.path or "/",
-            )
-            if c.name == "access_token":
-                self.access_token = c.value
+        for c in raw:
+            name  = c.get("name", "")
+            value = c.get("value", "")
+            if not name:
+                continue
+            self.session.cookies.set(name, value, domain=self.domain)
+            if name == "access_token":
+                self.access_token = value
 
     def ensure_valid_token(self):
         if not self.access_token:
@@ -379,7 +383,7 @@ class AuthManager:
         print(f"  {dim('[auth] Refreshing token...')}", end=" ", flush=True)
         for attempt in range(MAX_RETRIES + 1):
             try:
-                resp = self.session.post(f"{self.api_url}/auth/refresh")
+                resp = self.session.post(f"{self.api_url}/auth/refresh", timeout=30)
                 if resp.status_code != 200:
                     print(yellow("skipped (failed)"))
                     return
@@ -437,7 +441,7 @@ def upload_buffer_tus(session, api_url, site_url,
     }
 
     def do_create():
-        r = session.post(f"{api_url}/tus/", headers=headers, content=b"")
+        r = session.post(f"{api_url}/tus/", headers=headers, data=b"", timeout=30)
         r.raise_for_status()
         return r
 
@@ -467,7 +471,7 @@ def upload_buffer_tus(session, api_url, site_url,
         }
 
         def do_patch(ch=chunk, ph=patch_headers):
-            r = session.patch(upload_url, headers=ph, content=ch)
+            r = session.patch(upload_url, headers=ph, data=ch, timeout=120)
             if r.status_code == 409:
                 # Server already has data past this offset — query real offset and resume
                 real_offset = get_tus_offset(session, upload_url)
@@ -491,7 +495,6 @@ def upload_buffer_tus(session, api_url, site_url,
                 print(f'    Resuming from server offset: {format_size(offset)}')
             except Exception:
                 pass
-            raise
             raise
 
         pct       = min(100, int(offset / file_size * 100))
@@ -537,7 +540,7 @@ def fetch_existing_uploads(session, api_url, manga_id, language):
     existing = {}
     page = 1
     while True:
-        resp = session.get(f"{api_url}/uploads/mine", params={"page": page, "limit": 100})
+        resp = session.get(f"{api_url}/uploads/mine", params={"page": page, "limit": 100}, timeout=30)
         if resp.status_code != 200:
             return existing
         data    = resp.json()
@@ -557,7 +560,7 @@ def fetch_existing_uploads(session, api_url, manga_id, language):
     return existing
 
 def delete_upload(session, api_url, upload_id):
-    resp = session.delete(f"{api_url}/uploads/{upload_id}")
+    resp = session.delete(f"{api_url}/uploads/{upload_id}", timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success"):
@@ -611,8 +614,11 @@ def main():
     parser.add_argument("--reupload", action="store_true",
                         help="Delete and re-upload chapters that already exist")
     parser.add_argument("--refresh-cookies", action="store_true",
-                        help="Force a fresh nodriver login (auto mode only); "
+                        help="Force a fresh rookiepy cookie read (auto mode only); "
                              "ignore cached cookies")
+    parser.add_argument("--debug-auth", action="store_true",
+                        help="Print cookies and HTTP response details during auth "
+                             "(useful for diagnosing login failures)")
     args = parser.parse_args()
 
     # --chapter doubles as --start/--end when not using --zip
@@ -769,15 +775,23 @@ def main():
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36",
     )
-    session = httpx.Client(
-        headers={
-            "User-Agent": user_agent,
-            "Origin":     site_url,
-            "Referer":    f"{site_url}/upload",
-        },
-        follow_redirects=True,
-        timeout=120.0,
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Origin":     site_url,
+        "Referer":    f"{site_url}/upload",
+    })
+    # Attach a retry adapter so transient 502/503/504 errors are handled at
+    # the transport level in addition to our manual with_retry() wrapper.
+    _retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[502, 503, 504, 520, 521, 522, 524],
+        allowed_methods=["HEAD", "GET", "POST", "PATCH", "DELETE"],
     )
+    _adapter = HTTPAdapter(max_retries=_retry)
+    session.mount("https://", _adapter)
+    session.mount("http://",  _adapter)
     auth = AuthManager(session, site_url, api_url, domain)
 
     mode         = get("auth", "mode")
@@ -787,20 +801,15 @@ def main():
     browser      = get("auth", "browser")
 
     if mode == "auto":
-        username_v = get("auth", "username")
-        password_v = get("auth", "password")
-        if not (username_v and password_v):
-            print(f"  {red('Error:')} mode=auto requires username and password under [auth]")
-            sys.exit(1)
-        cache_file  = get("auth", "cache_file") or os.path.join(SCRIPT_DIR, ".auth-cache.json")
-        chrome_path = get("auth", "chrome_path")
+        browser_v  = get("auth", "browser", "chrome")
+        cache_file = get("auth", "cache_file") or os.path.join(SCRIPT_DIR, ".auth-cache.json")
         try:
             from auth_strategy import ensure_authenticated
         except ImportError:
             print(f"  {red('Error:')} auth_strategy.py not found alongside this script")
             sys.exit(1)
 
-        print(f"  Authenticating as {bold(username_v)}...", end=" ", flush=True)
+        print(f"  Extracting cookies from {bold(browser_v)}...", end=" ", flush=True)
         try:
             user_info, refresher = ensure_authenticated(
                 session,
@@ -808,11 +817,12 @@ def main():
                 api_url=api_url,
                 domain=domain,
                 cache_path=cache_file,
-                username=username_v,
-                password=password_v,
-                chrome_path=chrome_path,
+                username="",
+                password="",
+                browser=browser_v,
                 force_refresh=args.refresh_cookies,
-                on_refresh=lambda: print("\n  " + yellow("Cache stale - opening Chrome to refresh cookies...")),
+                debug=args.debug_auth,
+                on_refresh=lambda: print("\n  " + yellow("Cache stale — re-reading cookies from browser...")),
             )
         except RuntimeError as e:
             print(red("FAILED"))
@@ -823,10 +833,9 @@ def main():
         # Sync access_token so AuthManager's JWT-expiry check sees it.
         auth.access_token = session.cookies.get("access_token")
 
-        # Form-login doesn't issue a refresh_token cookie, so replace the
-        # AuthManager's refresh callback with a full nodriver re-login.
+        # Replace the AuthManager's refresh callback with a rookiepy re-read.
         def _auto_refresh():
-            print(f"  {dim('[auth] JWT near expiry; refreshing via Chrome...')}")
+            print(f"  {dim('[auth] JWT near expiry; refreshing via rookiepy...')}")
             try:
                 refresher()
                 auth.access_token = session.cookies.get("access_token")
@@ -867,29 +876,36 @@ def main():
 
     # ── Verify auth (with re-login prompt on Cloudflare block) ──
     def verify_session():
-        """Check /auth/me. On Cloudflare challenge, prompt user to re-login in
-        Firefox then reload cookies and retry. Returns username on success."""
+        """Check /api/profile. On Cloudflare challenge, prompt user to re-login
+        in their browser then reload cookies via rookiepy and retry.
+        Returns username on success."""
+        _browser = get("auth", "browser", "chrome")
         while True:
             print("  Verifying session...", end=" ", flush=True)
-            resp = session.get(f"{api_url}/auth/me")
+            resp = session.get(f"{site_url}/api/profile", timeout=15)
             if resp.status_code == 200:
-                return resp.json().get("user", {}).get("username", "unknown")
+                profile = resp.json().get("profile", {})
+                return (
+                    profile.get("username")
+                    or profile.get("email")
+                    or resp.json().get("username")
+                    or "unknown"
+                )
             print(red("FAILED"))
             is_cf = "Just a moment" in resp.text or "challenge-platform" in resp.text
             if is_cf:
                 print()
                 print(f"  {yellow('Cloudflare challenge — your cf_clearance cookie has expired.')}")
-                print(f"  {bold('1.')} Go to Firefox and log out of mangadot.net, then log back in.")
-                print(f"  {bold('2.')} Close ALL other Firefox windows/tabs if cookie extraction keeps failing.")
+                print(f"  {bold('1.')} Visit mangadot.net in {_browser} and log in if needed.")
+                print(f"  {bold('2.')} Complete any Cloudflare challenge in the browser.")
                 print(f"  {bold('3.')} Press Enter here when done, or type \'q\' to quit.")
                 choice = input("  > ").strip().lower()
                 if choice == "q":
                     sys.exit(0)
-                # Reload cookies from Firefox
-                print("  Reloading cookies from firefox...", end=" ", flush=True)
+                print(f"  Reloading cookies from {_browser}...", end=" ", flush=True)
                 session.cookies.clear()
                 try:
-                    auth.load_from_browser("firefox")
+                    auth.load_from_browser(_browser)
                     print(green("OK"))
                 except Exception as e:
                     print(red(f"FAILED: {e}"))
@@ -991,7 +1007,7 @@ def main():
             payload["scanlator_name"] = scanlator_name
 
         def do_batch_init():
-            r = session.post(f"{api_url}/uploads/batch/init", json=payload)
+            r = session.post(f"{api_url}/uploads/batch/init", json=payload, timeout=30)
             r.raise_for_status()
             return r
 
@@ -1045,8 +1061,10 @@ def main():
                         group_id, upload_type, scanlator_name,
                     )
                     break
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 401 and mode == "auto":
+                except requests.exceptions.HTTPError as e:
+                    _status = e.response.status_code if e.response is not None else 0
+                    _browser_v = get("auth", "browser", "chrome")
+                    if _status == 401 and mode == "auto":
                         # JWT expired mid-upload; refresh and retry the chapter.
                         print(f"\n  {yellow('401 mid-upload; refreshing cookies...')}", flush=True)
                         try:
@@ -1059,14 +1077,15 @@ def main():
                             print(f"  {red('refresh failed:')} {refresh_err}")
                             print(f"  Resume with: {bold(f'--start {ch_num}')}")
                             sys.exit(1)
-                    if e.response.status_code == 403 and (
-                        "Just a moment" in e.response.text or
-                        "challenge-platform" in e.response.text or
-                        cf_retry < 2
+                    if _status == 403 and (
+                        e.response is not None and (
+                            "Just a moment" in e.response.text or
+                            "challenge-platform" in e.response.text
+                        ) or cf_retry < 2
                     ):
                         print(f"\n  {yellow('Cloudflare block detected mid-upload.')}")
                         if mode == "auto":
-                            print(f"  {dim('Refreshing cookies via Chrome (auto mode)...')}")
+                            print(f"  {dim('Refreshing cookies via rookiepy (auto mode)...')}")
                             try:
                                 refresher()
                                 auth.access_token = session.cookies.get("access_token")
@@ -1077,17 +1096,17 @@ def main():
                                 print(f"  Resume with: {bold(f'--start {ch_num}')}")
                                 sys.exit(1)
                         else:
-                            print(f"  {bold('1.')} Log out and back in to mangadot.net in Firefox.")
+                            print(f"  {bold('1.')} Log out and back in to mangadot.net in {_browser_v}.")
                             print(f"  {bold('2.')} Press Enter to retry this chapter, or type \'q\' to quit.")
                             ch_num = ch["chapter"]
                             print(f"  (If you quit, resume with: {bold(f'--start {ch_num}')})")
                             choice = input("  > ").strip().lower()
                             if choice == "q":
                                 sys.exit(0)
-                            print("  Reloading cookies...", end=" ", flush=True)
+                            print(f"  Reloading cookies from {_browser_v}...", end=" ", flush=True)
                             session.cookies.clear()
                             try:
-                                auth.load_from_browser("firefox")
+                                auth.load_from_browser(_browser_v)
                                 print(green("OK"))
                             except Exception as reload_err:
                                 print(red(f"FAILED: {reload_err}"))
@@ -1111,7 +1130,7 @@ def main():
         print(f"\n  Finalizing batch {batch_idx}...", end=" ", flush=True)
 
         def do_finalize():
-            r = session.post(f"{api_url}/uploads/batch/{batch_id}/complete")
+            r = session.post(f"{api_url}/uploads/batch/{batch_id}/complete", timeout=30)
             if r.status_code == 401 and mode == "auto":
                 # JWT expired between the proactive check and the actual call;
                 # force-refresh via Chrome and retry the finalize once.
@@ -1122,7 +1141,7 @@ def main():
                 except Exception as refresh_err:
                     print(f"  {yellow('refresh failed:')} {refresh_err}")
                 else:
-                    r = session.post(f"{api_url}/uploads/batch/{batch_id}/complete")
+                    r = session.post(f"{api_url}/uploads/batch/{batch_id}/complete", timeout=30)
             r.raise_for_status()
             return r
 
