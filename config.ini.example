@@ -1,0 +1,51 @@
+[auth]
+# Your browser's User-Agent. Only consulted for cookies_file / browser modes.
+# For mode=auto, the UA captured by Chrome at refresh time wins.
+user_agent = Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0
+
+# Pick ONE auth method:
+
+# Option 1 (recommended for unattended / scheduled runs) -- "auto" mode.
+# Reads cached cookies and verifies them; on failure, spawns a real Chrome
+# window via nodriver, navigates to /login, waits for Cloudflare clearance and
+# the invisible Turnstile challenge, then submits username+password to harvest
+# fresh cookies. Cached in .auth-cache.json (gitignored).
+#
+# Requires Chrome installed and `pip install nodriver`.
+mode     = auto
+username = your_mangadot_username
+password = your_password
+# cache_file  = .auth-cache.json
+# chrome_path = C:\Program Files\Google\Chrome\Application\chrome.exe
+
+# Option 2 -- email + password against /api/auth/login (often blocked by
+# Cloudflare; left here for completeness).
+# email    = your@email.com
+# password = yourpassword
+
+# Option 3 -- JSON or Netscape cookies.txt exported from your browser.
+# cookies_file = C:\path\to\cookies.txt
+
+# Option 4 -- live browser cookie extraction (the original interactive mode).
+# browser = firefox
+
+[upload]
+# Fallback manga ID if you don't use --series or --manga
+manga_id = 12345
+
+# Language code
+language = en
+
+# "chapter" or "volume"
+upload_type = chapter
+
+# Your group or scanlator
+group_id = 0000
+# scanlator_name = Your Group Name
+
+[paths]
+# Fallback if you don't use --series or --folder
+# chapters_dir = C:\path\to\your\releases\Some Series
+
+[site]
+url = https://mangadot.net

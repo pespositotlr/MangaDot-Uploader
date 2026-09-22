@@ -1,0 +1,4 @@
+{
+    "Series Name One":  { "manga_id": 12345, "chapter_dir": "C:\\path\\to\\releases\\Series Name One" },
+    "Series Name Two":  { "manga_id": 67890, "chapter_dir": "C:\\path\\to\\releases\\Series Name Two" }
+}
