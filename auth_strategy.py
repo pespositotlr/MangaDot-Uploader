@@ -243,6 +243,11 @@ def _read_firefox_cookies_direct(domain: str) -> tuple:
         tmp_path = tmp.name
     try:
         shutil.copy2(db_path, tmp_path)
+        # Firefox writes recent cookie changes (e.g. a fresh login) to the -wal file
+        # first; copy it too, or the newest session cookie is missed.
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(db_path + ext):
+                shutil.copy2(db_path + ext, tmp_path + ext)
         conn = sqlite3.connect(tmp_path)
         rows = conn.execute(
             "SELECT name, value, expiry FROM moz_cookies WHERE host LIKE ?",
@@ -250,10 +255,11 @@ def _read_firefox_cookies_direct(domain: str) -> tuple:
         ).fetchall()
         conn.close()
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        for p in (tmp_path, tmp_path + "-wal", tmp_path + "-shm"):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
     if not rows:
         raise RuntimeError(
             f"No cookies found for {domain!r} in Firefox profile at: {profile}. "
