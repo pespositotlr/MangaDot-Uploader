@@ -1,7 +1,7 @@
 r"""MangaDot catch-up + login watch (2026-10-12).
 
   py mangadot_owed.py add --post-title "Gintama Volume 75" --volume 75 --chapter 676 --chapter-name "..." --file "K:\...\676.zip"
-  py mangadot_owed.py run      # what the scheduled task runs every 30 min
+  py mangadot_owed.py run      # upload everything owed (if logged in)
   py mangadot_owed.py list
 
 `run`: checks the Firefox MangaDot login.
@@ -83,7 +83,7 @@ def _run(a):
     if code == 1:  # Cloudflare pass only: the refresh script fixes that by itself
         subprocess.run(["py", os.path.join(HERE, "mangadot_refresh.py")], capture_output=True, text=True)
         code, msg = check()
-    if code != 0:  # try the scheduled auto-login before bothering the user
+    if code != 0:  # try the auto-login before bothering the user
         subprocess.run(["py", os.path.join(HERE, "mangadot_login.py")], capture_output=True, text=True)
         code, msg = check()
     if code != 0:

@@ -1,6 +1,6 @@
 r"""Keep MangaDot logged in for the uploader, so releases work when nobody is at the PC.
 
-Meant to run on a schedule (Windows Task Scheduler). Each run:
+mangadot-upload.py runs this before every upload (no scheduled task needed). Each run:
   1. Asks MangaDot how long the current login has left (the uploader's cache and Firefox's cookies, whichever is newer).
   2. If more than RENEW_DAYS are left, it only makes sure the uploader's cache holds that login, then stops.
   3. Otherwise it logs in the same way the mangadot.net login page does (username + password form), using
@@ -14,7 +14,7 @@ One-time setup (you type the password at the hidden prompt):
     py -m keyring set mangadot <your MangaDot username>
 
 Usage:
-    py mangadot_login.py           # log in only if needed (what the scheduled task runs)
+    py mangadot_login.py           # log in only if needed (what the uploader runs)
     py mangadot_login.py --check   # just report, never log in
     py mangadot_login.py --force   # log in now even if the current login is fine
 Exit code 0 = logged in, 1 = could not log in (details in mangadot_login_log.txt; a Discord DM is sent at most every 12 h).
