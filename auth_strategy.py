@@ -8,7 +8,7 @@ Strategy:
   3. Verify session via a plain requests GET to /api/profile.
 
 Requirements:
-    py -3.13 -m pip install rookiepy requests
+    py -m pip install rookiepy requests
 """
 
 import json
@@ -299,12 +299,26 @@ def _extract_cookies_rookiepy(browser: str, domain: str) -> dict:
     Returns a plain dict {name: value}.
     Raises RuntimeError on failure.
     """
+    # For Firefox, bypass rookiepy entirely and read the correct profile's
+    # cookies.sqlite directly — rookiepy's auto-detection picks the wrong
+    # profile when multiple profiles exist (e.g. default vs default-release).
+    # This also means Firefox users don't need rookiepy installed at all
+    # (it has no wheels for Python 3.14+).
+    if browser.lower() == "firefox":
+        cookies, _cf_expiry = _read_firefox_cookies_direct(domain)
+        if not cookies:
+            raise RuntimeError(
+                f"No cookies found for {domain!r} in Firefox. "
+                f"Make sure you are logged in to {domain} in Firefox."
+            )
+        return cookies
+
     try:
         import rookiepy
     except ImportError:
         raise RuntimeError(
-            "rookiepy is not installed.\n"
-            "Run:  py -3.13 -m pip install rookiepy"
+            "rookiepy is not installed (needed for non-Firefox browsers).\n"
+            "Run:  py -m pip install rookiepy"
         )
 
     fn = getattr(rookiepy, browser.lower(), None)
@@ -314,18 +328,6 @@ def _extract_cookies_rookiepy(browser: str, domain: str) -> dict:
             f"Unsupported browser: {browser!r}. "
             f"Supported: {supported}"
         )
-
-    # For Firefox, bypass rookiepy entirely and read the correct profile's
-    # cookies.sqlite directly — rookiepy's auto-detection picks the wrong
-    # profile when multiple profiles exist (e.g. default vs default-release).
-    if browser.lower() == "firefox":
-        cookies, _cf_expiry = _read_firefox_cookies_direct(domain)
-        if not cookies:
-            raise RuntimeError(
-                f"No cookies found for {domain!r} in Firefox. "
-                f"Make sure you are logged in to {domain} in Firefox."
-            )
-        return cookies
 
     try:
         raw = fn(domains=[domain, f".{domain}"])

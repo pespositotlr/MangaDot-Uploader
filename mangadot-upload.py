@@ -344,7 +344,7 @@ class AuthManager:
         except ImportError:
             raise RuntimeError(
                 "rookiepy is not installed.\n"
-                "Run: py -3.13 -m pip install rookiepy"
+                "Run: py -m pip install rookiepy"
             )
         fn = getattr(rookiepy, browser.lower(), None)
         if fn is None:
@@ -821,6 +821,18 @@ def main():
         except ImportError:
             print(f"  {red('Error:')} auth_strategy.py not found alongside this script")
             sys.exit(1)
+
+        # Make sure the cache holds a working login: mangadot_login.py only logs in (password from
+        # Windows Credential Manager) when the current login is gone or has under 2 days left.
+        # If it fails, carry on with whatever login the cache/browser already has.
+        login_script = os.path.join(SCRIPT_DIR, "mangadot_login.py")
+        if os.path.exists(login_script):
+            print("  Checking MangaDot login...", end=" ", flush=True)
+            import subprocess
+            r = subprocess.run([sys.executable, login_script], capture_output=True, text=True)
+            lines = (r.stdout + r.stderr).strip().splitlines()
+            last = lines[-1][17:] if lines else "(no output)"  # drop the log timestamp
+            print(green(last) if r.returncode == 0 else yellow(f"failed ({last}); using the existing login"))
 
         print(f"  Extracting cookies from {bold(browser_v)}...", end=" ", flush=True)
         try:

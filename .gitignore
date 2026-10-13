@@ -25,3 +25,13 @@ env/
 # OS
 Thumbs.db
 .DS_Store
+
+# local backups (may contain credentials)
+*.bak_*
+
+# helper-script state and logs (mangadot_login / mangadot_owed)
+mangadot_owed.json
+mangadot_*_state.json
+mangadot_*_log.txt
+mangadot_owed_*.log
+mangadot_owed.lock

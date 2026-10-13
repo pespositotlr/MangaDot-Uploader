@@ -49,3 +49,13 @@ group_id = 0000
 
 [site]
 url = https://mangadot.net
+
+[alerts]
+# Discord DMs from mangadot_login.py / mangadot_owed.py when something needs you.
+# discord_bot_file is a text file with a line ACCESS_TOKEN=<bot token>.
+discord_user_id  = your_discord_user_id
+discord_bot_file = C:/path/to/discord_bot.txt
+
+[release]
+# Manga-Release-Manager checkout (mangadot_owed.py runs its release-updater.py).
+manager_dir = C:/path/to/Manga-Release-Manager
