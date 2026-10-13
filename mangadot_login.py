@@ -1,7 +1,7 @@
 r"""Keep MangaDot logged in for the uploader, so releases work when nobody is at the PC.
 
 mangadot-upload.py runs this before every upload (no scheduled task needed). Each run:
-  1. Asks MangaDot how long the current login has left (the uploader's cache and Firefox's cookies, whichever is newer).
+  1. Asks MangaDot how long the current login has left (the uploader's cache first, then Firefox's cookies).
   2. If more than RENEW_DAYS are left, it only makes sure the uploader's cache holds that login, then stops.
   3. Otherwise it logs in the same way the mangadot.net login page does (username + password form), using
      Firefox's Cloudflare pass, and saves the new login to the uploader's cache:
