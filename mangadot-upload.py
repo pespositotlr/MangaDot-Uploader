@@ -18,12 +18,14 @@ Usage:
 """
 
 import argparse
+import atexit
 import base64
 import configparser
 import io
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import zipfile
@@ -578,6 +580,43 @@ def delete_upload(session, api_url, upload_id):
     if not data.get("success"):
         raise RuntimeError(f"Delete returned success=false: {data}")
 
+def check_chapter_source(ch):
+    """Make sure a chapter's zip/images are readable before anything is deleted.
+    Returns an error string, or None if the source looks fine."""
+    try:
+        if "zip" in ch:
+            with zipfile.ZipFile(ch["zip"]) as zf:
+                if not zf.namelist():
+                    return "zip is empty"
+                bad = zf.testzip()
+                if bad:
+                    return f"zip is corrupt (bad entry: {bad})"
+        else:
+            if not ch["images"]:
+                return "no images"
+            for path in ch["images"]:
+                if os.path.getsize(path) == 0:
+                    return f"empty image: {os.path.basename(path)}"
+    except Exception as e:
+        return str(e)
+    return None
+
+# Chapters deleted by --reupload whose replacement hasn't been finalized yet.
+# If the script exits while this is non-empty, those chapters are missing
+# from MangaDot, so say so loudly.
+deleted_not_reuploaded = []
+
+def warn_deleted_not_reuploaded():
+    if not deleted_not_reuploaded:
+        return
+    nums = ", ".join(f"ch{n:g}" for n in deleted_not_reuploaded)
+    print()
+    print(red(bold(f"!! {nums} was deleted from MangaDot but the new upload did not finish.")))
+    print(red(bold("!! The chapter is missing from MangaDot now. Re-upload it with:")))
+    print(f"   py {subprocess.list2cmdline(sys.argv)}")
+
+atexit.register(warn_deleted_not_reuploaded)
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -998,18 +1037,53 @@ def main():
                 entry["chapter_title"] = ch["title"]
             chapters_info.append(entry)
 
-        # Delete existing chapters if --reupload
+        # Delete existing chapters if --reupload. MangaDot rejects a second
+        # upload with the same chapter number (TUS create returns 409), so the
+        # old one has to go first. Check everything we can before deleting so
+        # a failure leaves the old chapter in place.
         if args.reupload:
             to_delete = [
                 (ch, existing_uploads[ch["chapter"]])
                 for ch in batch if ch["chapter"] in existing_uploads
             ]
             if to_delete:
+                print("  Checking files before deleting...", end=" ", flush=True)
+                bad = []
+                for ch in batch:
+                    err = check_chapter_source(ch)
+                    if err:
+                        bad.append(f"ch{ch['chapter']:g}: {err}")
+                if bad:
+                    print(red("FAILED"))
+                    for msg in bad:
+                        print(f"    {msg}")
+                    print(f"  {dim('Nothing was deleted.')}")
+                    sys.exit(1)
+                print(green("OK"))
+
+                auth.ensure_valid_token()
+                print("  Checking login before deleting...", end=" ", flush=True)
+                try:
+                    r = session.get(f"{site_url}/api/profile", timeout=15)
+                    ok = r.status_code == 200
+                    why = f"HTTP {r.status_code}"
+                    if "Just a moment" in r.text or "challenge-platform" in r.text:
+                        why += " (Cloudflare challenge)"
+                except Exception as e:
+                    ok, why = False, str(e)
+                if not ok:
+                    print(red("FAILED"))
+                    print(f"    {why}")
+                    print(f"  {dim('Nothing was deleted.')}")
+                    sys.exit(1)
+                print(green("OK"))
+
                 print(f"  Deleting {len(to_delete)} existing chapter(s)...", end=" ", flush=True)
                 failed = []
                 for ch, existing in to_delete:
                     try:
                         delete_upload(session, api_url, existing["id"])
+                        deleted_not_reuploaded.append(ch["chapter"])
                     except Exception as e:
                         failed.append(f"ch{ch['chapter']:g}: {e}")
                 if failed:
@@ -1174,6 +1248,7 @@ def main():
             return r
 
         with_retry(do_finalize, "batch finalize")
+        deleted_not_reuploaded.clear()
         print(green("Done!\n"))
 
     elapsed = time.time() - overall_start
