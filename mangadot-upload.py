@@ -92,7 +92,7 @@ def is_retryable(exc):
         return True
     if isinstance(exc, requests.exceptions.HTTPError):
         return exc.response is not None and exc.response.status_code in (
-            502, 503, 504, 520, 521, 522, 524)
+            411, 502, 503, 504, 520, 521, 522, 524)   # 411: seen once on batch finalize, fine on retry
     return False
 
 def get_tus_offset(session, upload_url):
@@ -576,8 +576,12 @@ def fetch_existing_uploads(session, api_url, manga_id, language):
 def delete_upload(session, api_url, upload_id):
     resp = session.delete(f"{api_url}/uploads/{upload_id}", timeout=30)
     resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
+    # The API may answer a delete with an empty body; only an explicit success=false is a failure
+    try:
+        data = resp.json()
+    except ValueError:
+        return
+    if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(f"Delete returned success=false: {data}")
 
 def check_chapter_source(ch):
@@ -1112,7 +1116,8 @@ def main():
 
         resp = with_retry(do_batch_init, "batch init")
         data = resp.json()
-        if not data.get("success"):
+        # The API no longer always sends "success"; a batch_id means the batch was created
+        if not data.get("batch_id") or data.get("success") is False:
             print(red("FAILED"))
             print(f"  {data}")
             sys.exit(1)
